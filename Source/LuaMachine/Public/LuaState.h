@@ -1,4 +1,4 @@
-// Copyright 2019 - Roberto De Ioris
+// Copyright 2018-2020 - Roberto De Ioris
 
 #pragma once
 
@@ -242,6 +242,7 @@ public:
 	void PushNil();
 
 	void Unref(int Ref);
+	void UnrefChecked(int Ref);
 	int NewRef();
 	void GetRef(int Ref);
 	int Next(int Index);

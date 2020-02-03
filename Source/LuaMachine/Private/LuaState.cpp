@@ -439,18 +439,26 @@ void ULuaState::FromLuaValue(FLuaValue& LuaValue, UObject* CallContext, lua_Stat
 		NewUObject(LuaValue.Object);
 		if (ULuaComponent* LuaComponent = Cast<ULuaComponent>(LuaValue.Object))
 		{
-			// ensure we are in the same LuaState
-			if (LuaComponent->LuaState == GetClass())
+			if (!LuaComponent->LuaState)
 			{
-				SetupUserDataMetatable(LuaComponent->GetOwner(), LuaComponent->Metatable);
+				UE_LOG(LogLuaMachine, Warning, TEXT("%s has no associated LuaState"), *LuaComponent->GetFullName());
+			}
+			// ensure we are in the same LuaState
+			else if (LuaComponent->LuaState == GetClass())
+			{
+				SetupAndAssignUserDataMetatable(LuaComponent, LuaComponent->Metatable);
 			}
 		}
 		else if (ULuaUserDataObject* LuaUserDataObject = Cast<ULuaUserDataObject>(LuaValue.Object))
 		{
-			// ensure we are in the same LuaState
-			if (LuaUserDataObject->GetLuaState() == GetClass())
+			if (!LuaUserDataObject->GetLuaState())
 			{
-				SetupUserDataMetatable(LuaUserDataObject, LuaUserDataObject->Metatable);
+				UE_LOG(LogLuaMachine, Warning, TEXT("%s has no associated LuaState"), *LuaUserDataObject->GetFullName());
+			}
+			// ensure we are in the same LuaState
+			else if (LuaUserDataObject->GetLuaState() == GetClass())
+			{
+				SetupAndAssignUserDataMetatable(LuaUserDataObject, LuaUserDataObject->Metatable);
 			}
 		}
 		else {
@@ -499,20 +507,29 @@ void ULuaState::FromLuaValue(FLuaValue& LuaValue, UObject* CallContext, lua_Stat
 		}
 		if (CallContext)
 		{
-			UFunction* Function = CallContext->FindFunction(LuaValue.FunctionName);
-			if (Function)
+			UObject* FunctionOwner = CallContext;
+			if (ULuaComponent* LuaComponent = Cast<ULuaComponent>(CallContext))
 			{
-				// cache it for context-less calls
-				LuaValue.Object = CallContext;
-				FLuaUserData* LuaCallContext = (FLuaUserData*)lua_newuserdata(State, sizeof(FLuaUserData));
-				LuaCallContext->Type = ELuaValueType::UFunction;
-				LuaCallContext->Context = CallContext;
-				LuaCallContext->Function = Function;
-				lua_newtable(State);
-				lua_pushcfunction(State, ULuaState::MetaTableFunction__call);
-				lua_setfield(State, -2, "__call");
-				lua_setmetatable(State, -2);
-				return;
+				FunctionOwner = LuaComponent->GetOwner();
+			}
+
+			if (FunctionOwner)
+			{
+				UFunction* Function = FunctionOwner->FindFunction(LuaValue.FunctionName);
+				if (Function)
+				{
+					// cache it for context-less calls
+					LuaValue.Object = CallContext;
+					FLuaUserData* LuaCallContext = (FLuaUserData*)lua_newuserdata(State, sizeof(FLuaUserData));
+					LuaCallContext->Type = ELuaValueType::UFunction;
+					LuaCallContext->Context = CallContext;
+					LuaCallContext->Function = Function;
+					lua_newtable(State);
+					lua_pushcfunction(State, ULuaState::MetaTableFunction__call);
+					lua_setfield(State, -2, "__call");
+					lua_setmetatable(State, -2);
+					return;
+				}
 			}
 		}
 
@@ -626,13 +643,12 @@ int ULuaState::MetaTableFunctionUserData__index(lua_State* L)
 	if (ULuaComponent* LuaComponent = Cast<ULuaComponent>(Context))
 	{
 		TablePtr = &LuaComponent->Table;
-		Context = LuaComponent->GetOwner();
 	}
 	else if (ULuaUserDataObject* LuaUserDataObject = Cast<ULuaUserDataObject>(Context))
 	{
 		TablePtr = &LuaUserDataObject->Table;
 	}
-	
+
 	if (TablePtr)
 	{
 
@@ -666,7 +682,6 @@ int ULuaState::MetaTableFunctionUserData__newindex(lua_State* L)
 	if (ULuaComponent* LuaComponent = Cast<ULuaComponent>(Context))
 	{
 		TablePtr = &LuaComponent->Table;
-		Context = LuaComponent->GetOwner();
 	}
 	else if (ULuaUserDataObject* LuaUserDataObject = Cast<ULuaUserDataObject>(Context))
 	{
@@ -775,7 +790,20 @@ int ULuaState::MetaTableFunction__call(lua_State* L)
 
 	int NArgs = lua_gettop(L);
 
-	FScopeCycleCounterUObject ObjectScope(LuaCallContext->Context.Get());
+	UObject* CallScope = LuaCallContext->Context.Get();
+	bool bImplicitSelf = false;
+
+	if (ULuaComponent* LuaComponent = Cast<ULuaComponent>(CallScope))
+	{
+		CallScope = LuaComponent->GetOwner();
+		bImplicitSelf = LuaComponent->bImplicitSelf;
+	}
+	else if (ULuaUserDataObject* LuaUserDataObject = Cast<ULuaUserDataObject>(CallScope))
+	{
+		bImplicitSelf = LuaUserDataObject->bImplicitSelf;
+	}
+
+	FScopeCycleCounterUObject ObjectScope(CallScope);
 	FScopeCycleCounterUObject FunctionScope(LuaCallContext->Function.Get());
 
 	void* Parameters = FMemory_Alloca(LuaCallContext->Function->ParmsSize);
@@ -783,13 +811,10 @@ int ULuaState::MetaTableFunction__call(lua_State* L)
 
 	int StackPointer = 2;
 
-	if (LuaCallContext->Context.Get()->IsA<ULuaUserDataObject>())
+	if (bImplicitSelf)
 	{
-		if (Cast<ULuaUserDataObject>(LuaCallContext->Context.Get())->bImplicitSelf)
-		{
-			NArgs--;
-			StackPointer++;
-		}
+		NArgs--;
+		StackPointer++;
 	}
 
 	// arguments
@@ -829,7 +854,7 @@ int ULuaState::MetaTableFunction__call(lua_State* L)
 	}
 
 	LuaState->InceptionLevel++;
-	LuaCallContext->Context->ProcessEvent(LuaCallContext->Function.Get(), Parameters);
+	CallScope->ProcessEvent(LuaCallContext->Function.Get(), Parameters);
 	check(LuaState->InceptionLevel > 0);
 	LuaState->InceptionLevel--;
 
@@ -838,7 +863,7 @@ int ULuaState::MetaTableFunction__call(lua_State* L)
 		FString Error;
 		while (LuaState->InceptionErrors.Dequeue(Error))
 		{
-			ULuaComponent* LuaComponent = Cast <ULuaComponent>(LuaCallContext->Context);
+			ULuaComponent* LuaComponent = Cast<ULuaComponent>(LuaCallContext->Context);
 			if (LuaComponent)
 			{
 				if (LuaComponent->bLogError)
@@ -1435,7 +1460,7 @@ void ULuaState::SetUserDataMetaTable(FLuaValue MetaTable)
 	UserDataMetaTable = MetaTable;
 }
 
-void ULuaState::SetupUserDataMetatable(UObject* Context, TMap<FString, FLuaValue>& Metatable)
+void ULuaState::SetupAndAssignUserDataMetatable(UObject* Context, TMap<FString, FLuaValue>& Metatable)
 {
 	lua_newtable(L);
 	lua_pushcfunction(L, ULuaState::MetaTableFunctionUserData__index);
@@ -1450,22 +1475,31 @@ void ULuaState::SetupUserDataMetatable(UObject* Context, TMap<FString, FLuaValue
 		// first check for UFunction
 		if (Pair.Value.Type == ELuaValueType::UFunction)
 		{
-			UFunction* Function = Context->FindFunction(Pair.Value.FunctionName);
-			if (Function)
+			UObject* FunctionOwner = Context;
+			if (ULuaComponent* LuaComponent = Cast<ULuaComponent>(Context))
 			{
-				FLuaUserData* LuaCallContext = (FLuaUserData*)lua_newuserdata(L, sizeof(FLuaUserData));
-				LuaCallContext->Type = ELuaValueType::UFunction;
-				LuaCallContext->Context = Context;
-				LuaCallContext->Function = Function;
-
-				lua_newtable(L);
-				lua_pushcfunction(L, ULuaState::MetaTableFunction__call);
-				lua_setfield(L, -2, "__call");
-				lua_setmetatable(L, -2);
+				FunctionOwner = LuaComponent->GetOwner();
 			}
-			else
+
+			if (FunctionOwner)
 			{
-				lua_pushnil(L);
+				UFunction* Function = FunctionOwner->FindFunction(Pair.Value.FunctionName);
+				if (Function)
+				{
+					FLuaUserData* LuaCallContext = (FLuaUserData*)lua_newuserdata(L, sizeof(FLuaUserData));
+					LuaCallContext->Type = ELuaValueType::UFunction;
+					LuaCallContext->Context = Context;
+					LuaCallContext->Function = Function;
+
+					lua_newtable(L);
+					lua_pushcfunction(L, ULuaState::MetaTableFunction__call);
+					lua_setfield(L, -2, "__call");
+					lua_setmetatable(L, -2);
+				}
+				else
+				{
+					lua_pushnil(L);
+				}
 			}
 		}
 		else {

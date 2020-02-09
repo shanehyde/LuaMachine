@@ -11,6 +11,12 @@
 #include "Engine/Texture2D.h"
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
+#include "IPlatformFilePak.h"
+#include "HAL/PlatformFilemanager.h"
+#include "IAssetRegistry.h"
+#include "AssetRegistryModule.h"
+#include "Misc/FileHelper.h"
+#include "Serialization/ArrayReader.h"
 
 FLuaValue ULuaBlueprintFunctionLibrary::LuaCreateNil()
 {
@@ -1156,6 +1162,31 @@ TArray<FLuaValue> ULuaBlueprintFunctionLibrary::LuaValueCallMulti(FLuaValue Valu
 	return ReturnValue;
 }
 
+void ULuaBlueprintFunctionLibrary::LuaValueYield(FLuaValue Value, TArray<FLuaValue> Args)
+{
+	if (Value.Type != ELuaValueType::Thread)
+		return;
+
+	ULuaState* L = Value.LuaState;
+	if (!L)
+		return;
+
+	L->FromLuaValue(Value);
+
+	int32 StackTop = L->GetTop();
+
+	int NArgs = 0;
+	for (FLuaValue& Arg : Args)
+	{
+		L->FromLuaValue(Arg);
+		NArgs++;
+	}
+
+	L->Yield(-1 - NArgs, NArgs);
+
+	L->Pop();
+}
+
 TArray<FLuaValue> ULuaBlueprintFunctionLibrary::LuaValueResumeMulti(FLuaValue Value, TArray<FLuaValue> Args)
 {
 	TArray<FLuaValue> ReturnValue;
@@ -1200,15 +1231,15 @@ FVector ULuaBlueprintFunctionLibrary::LuaTableToVector(FLuaValue Value)
 	if (Value.Type != ELuaValueType::Table)
 		return FVector(NAN);
 
-	auto GetVectorField = [](FLuaValue Value, const char* Field_n, const char* Field_N, int32 Index) -> FLuaValue
+	auto GetVectorField = [](FLuaValue Table, const char* Field_n, const char* Field_N, int32 Index) -> FLuaValue
 	{
-		FLuaValue N = Value.GetField(Field_n);
+		FLuaValue N = Table.GetField(Field_n);
 		if (N.IsNil())
 		{
-			N = Value.GetField(Field_N);
+			N = Table.GetField(Field_N);
 			if (N.IsNil())
 			{
-				N = Value.GetFieldByIndex(Index);
+				N = Table.GetFieldByIndex(Index);
 				if (N.IsNil())
 					N = FLuaValue(NAN);
 			}
@@ -1477,4 +1508,123 @@ FString ULuaBlueprintFunctionLibrary::LuaValueToJson(FLuaValue Value)
 	TSharedRef<TJsonWriter<>> JsonWriter = TJsonWriterFactory<>::Create(&Json);
 	FJsonSerializer::Serialize(Value.ToJsonValue(), "", JsonWriter);
 	return Json;
+}
+
+bool ULuaBlueprintFunctionLibrary::LuaLoadPakFile(FString Filename, FString Mountpoint, TArray<FLuaValue>& Assets, FString ContentPath, FString AssetRegistryPath)
+{
+	if (!Mountpoint.StartsWith("/") || !Mountpoint.EndsWith("/"))
+	{
+		UE_LOG(LogLuaMachine, Error, TEXT("Invalid Mountpoint, must be in the format /Name/"));
+		return false;
+	}
+
+	IPlatformFile& TopPlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	bool bCustomPakPlatformFile = false;
+
+	FPakPlatformFile* PakPlatformFile = (FPakPlatformFile*)FPlatformFileManager::Get().FindPlatformFile(TEXT("PakFile"));
+	if (!PakPlatformFile)
+	{
+		PakPlatformFile = new FPakPlatformFile();
+		if (!PakPlatformFile->Initialize(&TopPlatformFile, TEXT("")))
+		{
+			UE_LOG(LogLuaMachine, Error, TEXT("Unable to setup PakPlatformFile"));
+			delete(PakPlatformFile);
+			return false;
+		}
+		FPlatformFileManager::Get().SetPlatformFile(*PakPlatformFile);
+		bCustomPakPlatformFile = true;
+	}
+
+	FPakFile PakFile(PakPlatformFile, *Filename, false);
+	if (!PakFile.IsValid())
+	{
+		UE_LOG(LogLuaMachine, Error, TEXT("Unable to open PakFile"));
+		if (bCustomPakPlatformFile)
+		{
+			FPlatformFileManager::Get().SetPlatformFile(TopPlatformFile);
+			delete(PakPlatformFile);
+		}
+		return false;
+	}
+
+	FPaths::MakeStandardFilename(Mountpoint);
+
+	FString PakFileMountPoint(PakFile.GetMountPoint());
+	FPaths::MakeStandardFilename(PakFileMountPoint);
+	PakFile.SetMountPoint(*PakFileMountPoint);
+
+	if (!PakPlatformFile->Mount(*Filename, 0, *PakFile.GetMountPoint()))
+	{
+		UE_LOG(LogLuaMachine, Error, TEXT("Unable to mount PakFile"));
+		if (bCustomPakPlatformFile)
+		{
+			FPlatformFileManager::Get().SetPlatformFile(TopPlatformFile);
+			delete(PakPlatformFile);
+		}
+		return false;
+	}
+
+	if (ContentPath.IsEmpty())
+	{
+		ContentPath = "/Plugins" + Mountpoint + "Content/";
+	}
+
+	FString MountDestination = PakFile.GetMountPoint() + ContentPath;
+	FPaths::MakeStandardFilename(MountDestination);
+
+	FPackageName::RegisterMountPoint(Mountpoint, MountDestination);
+
+	IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+
+#if WITH_EDITOR
+	int32 bPreviousGAllowUnversionedContentInEditor = GAllowUnversionedContentInEditor;
+	GAllowUnversionedContentInEditor = true;
+#endif
+
+	if (AssetRegistryPath.IsEmpty())
+	{
+		AssetRegistryPath = "/Plugins" + Mountpoint + "AssetRegistry.bin";
+	}
+
+	FArrayReader SerializedAssetData;
+	if (!FFileHelper::LoadFileToArray(SerializedAssetData, *(PakFile.GetMountPoint() + AssetRegistryPath)))
+	{
+		UE_LOG(LogLuaMachine, Error, TEXT("Unable to parse AssetRegistry file"));
+		if (bCustomPakPlatformFile)
+		{
+			FPlatformFileManager::Get().SetPlatformFile(TopPlatformFile);
+			delete(PakPlatformFile);
+		}
+#if WITH_EDITOR
+		GAllowUnversionedContentInEditor = bPreviousGAllowUnversionedContentInEditor;
+#endif
+		return false;
+	}
+
+	AssetRegistry.Serialize(SerializedAssetData);
+
+	AssetRegistry.ScanPathsSynchronous({ Mountpoint }, true);
+
+	TArray<FAssetData> AssetData;
+	AssetRegistry.GetAllAssets(AssetData, false);
+
+	for (auto Asset : AssetData)
+	{
+		if (Asset.ObjectPath.ToString().StartsWith(Mountpoint))
+		{
+			Assets.Add(FLuaValue(Asset.GetAsset()));
+		}
+	}
+
+	if (bCustomPakPlatformFile)
+	{
+		FPlatformFileManager::Get().SetPlatformFile(TopPlatformFile);
+		delete(PakPlatformFile);
+	}
+
+#if WITH_EDITOR
+	GAllowUnversionedContentInEditor = bPreviousGAllowUnversionedContentInEditor;
+#endif
+
+	return true;
 }
